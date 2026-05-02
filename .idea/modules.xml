@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ProjectModuleManager">
+    <modules>
+      <module fileurl="file://$PROJECT_DIR$/agent-service/agent-service.iml" filepath="$PROJECT_DIR$/agent-service/agent-service.iml" />
+      <module fileurl="file://$PROJECT_DIR$/api-gateway/api-gateway.iml" filepath="$PROJECT_DIR$/api-gateway/api-gateway.iml" />
+      <module fileurl="file://$PROJECT_DIR$/auth-service/auth-service.iml" filepath="$PROJECT_DIR$/auth-service/auth-service.iml" />
+      <module fileurl="file://$PROJECT_DIR$/common/common.iml" filepath="$PROJECT_DIR$/common/common.iml" />
+      <module fileurl="file://$PROJECT_DIR$/realtime-service/realtime-service.iml" filepath="$PROJECT_DIR$/realtime-service/realtime-service.iml" />
+      <module fileurl="file://$PROJECT_DIR$/wind-power-microservice.iml" filepath="$PROJECT_DIR$/wind-power-microservice.iml" />
+    </modules>
+  </component>
+</project>

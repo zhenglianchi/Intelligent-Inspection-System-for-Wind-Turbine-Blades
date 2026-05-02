@@ -1,0 +1,114 @@
+.dashboard-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: #0a1628;
+}
+
+/* Top Bar */
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 28px;
+  background: #0d1b2a;
+  border-bottom: 1px solid #1a3344;
+}
+
+.top-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: #e8e8e8;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title-icon {
+  font-size: 26px;
+}
+
+.top-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.status-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.ok-badge {
+  background: rgba(102, 187, 106, 0.15);
+  color: #66bb6a;
+  border: 1px solid rgba(102, 187, 106, 0.3);
+}
+
+.loading-badge {
+  background: rgba(79, 195, 247, 0.15);
+  color: #4fc3f7;
+  border: 1px solid rgba(79, 195, 247, 0.3);
+  animation: pulse-badge 1.5s infinite;
+}
+
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.point-count {
+  font-size: 14px;
+  color: #667788;
+}
+
+/* Selector Section */
+.selector-section {
+  padding: 20px 28px;
+  background: #0c1a28;
+  border-bottom: 1px solid #1a3344;
+}
+
+/* Chart Section */
+.chart-section {
+  flex: 1;
+  padding: 20px 28px;
+  min-height: 420px;
+}
+
+/* Values Section */
+.values-section {
+  padding: 0 28px 20px;
+}
+
+/* Bottom Bar */
+.bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 28px;
+  background: #0d1b2a;
+  border-top: 1px solid #1a3344;
+  font-size: 13px;
+}
+
+.error-text {
+  color: #ef5350;
+}
+
+.hint-text {
+  color: #667788;
+}
+
+.bottom-right {
+  color: #556677;
+}
