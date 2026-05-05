@@ -215,4 +215,16 @@ public class RealTimeMonitorController {
         return realTimeService.queryByConditions(query);
     }
 
+    /**
+     * MySQL 直查对比接口（不走Redis）
+     * 用于性能基准测试：与 /quaryLatestFeaCurve (Redis方案) 对比
+     */
+    @GetMapping("/queryLastNFromDB")
+    public Result queryLastNFromDB(
+            @RequestParam String windfarm,
+            @RequestParam Integer windturbine,
+            @RequestParam(defaultValue = "20") Integer N) {
+        return realTimeService.queryLastNFromDB(windfarm, windturbine, N);
+    }
+
 }

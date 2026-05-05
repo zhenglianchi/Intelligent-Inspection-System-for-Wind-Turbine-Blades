@@ -500,6 +500,23 @@ public class RealtimeServiceImpl implements RealTimeService {
         return Result.buildResult(Result.Status.SUCCESS, "ok", list);
     }
 
+    @Override
+    public Result queryLastNFromDB(String windfarm, Integer windturbine, Integer N) {
+        if (N == null || N <= 0) N = 20;
+        // 构建与 Redis 版完全相同的 FeaCurveBO，保证对比公平
+        LinkedList<FeaPointDO> list = realtimeMapper.queryLastNRecord(windfarm, windturbine, N);
+        FeaCurveBO curve = FeaCurveBO.builder()
+                .capacity(N)
+                .windfarm(windfarm)
+                .windturbine(windturbine)
+                .feePoints(new java.util.LinkedList<>())
+                .build();
+        if (list != null) {
+            for (FeaPointDO p : list) curve.addFeePoint(p);
+        }
+        return Result.buildResult(Result.Status.SUCCESS, "ok", curve);
+    }
+
     /**
      * 获取指定风机最新原始txt文件数据（最多20万点，支持降采样）
      *

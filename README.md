@@ -1,10 +1,10 @@
 # Intelligent Inspection System for Wind Turbine Blades
 
-## 风电场叶片智能巡检与 RAG 智能助手系统
+## 风电场叶片智能监测与 RAG 智能助手系统
 
 ---
 
-> **项目说明**：本项目是基于某企业内部风场监测系统的重构与升级版本。原项目因涉及商业保密协议无法开源，本仓库为去掉敏感信息后重新架构的微服务版本，新增了 RAG 智能对话、知识库管理、多条件数据查询等能力，并将原单体架构拆分为标准微服务体系。
+> **项目说明**：本项目是基于风场监测系统的重构版本。原项目因涉及商业保密协议无法开源，本仓库为去掉敏感信息后重新架构的微服务版本，新增了 RAG 智能对话、知识库管理、多条件数据查询等能力，并将原单体架构拆分为标准微服务体系。
 
 ---
 
@@ -91,26 +91,28 @@ Intelligent-Inspection-System-for-Wind-Turbine-Blades/
 
 不独立部署，被 auth-service、realtime-service、agent-service 依赖。
 
-| 类别 | 内容 | 意义 |
-|------|------|------|
-| 通用响应 | `Result<T>` | 前后端统一 JSON 格式，OpenFeign 反序列化 |
-| 安全 | `JwtAuthenticationFilter`, `JwtService`, `JwtConfig` | 三服务共用一套 JWT 鉴权 |
+
+| 类别     | 内容                                                         | 意义                                        |
+| -------- | ------------------------------------------------------------ | ------------------------------------------- |
+| 通用响应 | `Result<T>`                                                  | 前后端统一 JSON 格式，OpenFeign 反序列化    |
+| 安全     | `JwtAuthenticationFilter`, `JwtService`, `JwtConfig`         | 三服务共用一套 JWT 鉴权                     |
 | 实体/DTO | `UserDO`, `RealtimeDO`, `WindfarmInfoDO`, `RealtimeQueryDTO` | 跨服务共享，避免 agent 和 realtime 各自定义 |
-| 常量 | `Constants`(0/1/9), `CacheConstant`(Redis key) | 集中管理状态码和缓存键 |
-| 配置 | `RedisConfig` | 统一 JSON 序列化 (Jackson + JavaTimeModule) |
+| 常量     | `Constants`(0/1/9), `CacheConstant`(Redis key)               | 集中管理状态码和缓存键                      |
+| 配置     | `RedisConfig`                                                | 统一 JSON 序列化 (Jackson + JavaTimeModule) |
 
 ### 3.2 api-gateway :8080
 
 所有前端请求入口。Spring Cloud Gateway (WebFlux/Netty 非阻塞 I/O)。
 
-| 路由 | 目标 | 说明 |
-|------|------|------|
-| `/api/**` | `lb://agent-service` | RAG 对话、知识库、降级 |
-| `/realtime/**` | `lb://realtime-service` | 风机监测、特征曲线 |
-| `/windturbine/**` | `lb://realtime-service` | 风机状态查询 |
-| `/searchMaxWindturbineId/**` | `lb://realtime-service` | 最大风机编号 |
-| `/windfarms/**` | `lb://realtime-service` | 风场列表 |
-| `/user/**` | `lb://auth-service` | 用户登录/注册/管理 |
+
+| 路由                         | 目标                    | 说明                   |
+| ---------------------------- | ----------------------- | ---------------------- |
+| `/api/**`                    | `lb://agent-service`    | RAG 对话、知识库、降级 |
+| `/realtime/**`               | `lb://realtime-service` | 风机监测、特征曲线     |
+| `/windturbine/**`            | `lb://realtime-service` | 风机状态查询           |
+| `/searchMaxWindturbineId/**` | `lb://realtime-service` | 最大风机编号           |
+| `/windfarms/**`              | `lb://realtime-service` | 风场列表               |
+| `/user/**`                   | `lb://auth-service`     | 用户登录/注册/管理     |
 
 **为什么需要网关？** 前端只需知道 `:8080`，跨域统一处理，Nacos 动态路由，负载均衡，生产环境可配限流和日志。
 
@@ -118,44 +120,47 @@ Intelligent-Inspection-System-for-Wind-Turbine-Blades/
 
 独立部署，只访问 `hm_user` 表。JWT HS512 算法，24h 有效。
 
-| 端点 | 说明 |
-|------|------|
-| `POST /user/login` | 登录返回 JWT token |
-| `POST /user/createNewUser` | 注册新用户 |
-| `GET /user/searchAllUser` | 全部用户列表 |
-| `GET /user/searchUser` | 分页查询 |
-| `GET /user/deleteUser` | 删除用户 |
+
+| 端点                       | 说明               |
+| -------------------------- | ------------------ |
+| `POST /user/login`         | 登录返回 JWT token |
+| `POST /user/createNewUser` | 注册新用户         |
+| `GET /user/searchAllUser`  | 全部用户列表       |
+| `GET /user/searchUser`     | 分页查询           |
+| `GET /user/deleteUser`     | 删除用户           |
 
 ### 3.4 realtime-service :8083
 
 核心数据接入处理服务。双通道：MQTT (流式遥测) + MySQL (持久化查询)。
 
-| 端点 | 说明 |
-|------|------|
-| `GET /realtime/quaryLatestFeaCurve` | 特征曲线 (Redis 队列, 20点) |
-| `GET /realtime/query` | **多条件灵活查询** (6个可选参数) |
-| `GET /realtime/queryWindFarmLastRecord` | 风场最新 N 条记录 |
-| `GET /searchMaxWindturbineId` | 风场最大风机编号 |
-| `GET /windturbine/queryAllWindturbineStatus` | 风机状态总览 |
-| `GET /windfarms` | 列出所有风场及风机数 |
-| `GET /realtime/getLatestTxtSpectrumData` | FFT 频谱数据 |
-| `POST /realtime/insertRealtimeData` | MQTT 触发的数据写入 |
+
+| 端点                                         | 说明                             |
+| -------------------------------------------- | -------------------------------- |
+| `GET /realtime/quaryLatestFeaCurve`          | 特征曲线 (Redis 队列, 20点)      |
+| `GET /realtime/query`                        | **多条件灵活查询** (6个可选参数) |
+| `GET /realtime/queryWindFarmLastRecord`      | 风场最新 N 条记录                |
+| `GET /searchMaxWindturbineId`                | 风场最大风机编号                 |
+| `GET /windturbine/queryAllWindturbineStatus` | 风机状态总览                     |
+| `GET /windfarms`                             | 列出所有风场及风机数             |
+| `GET /realtime/getLatestTxtSpectrumData`     | FFT 频谱数据                     |
+| `POST /realtime/insertRealtimeData`          | MQTT 触发的数据写入              |
 
 ### 3.5 agent-service :8084
 
 LLM 驱动的智能运维助手。通过 OpenFeign 调用 realtime-service。
 
-| 端点 | 说明 |
-|------|------|
-| `POST /api/chat` | 同步对话 |
-| `POST /api/chat/stream` | **SSE 流式对话** (逐字输出) |
-| `GET /api/degradation/status` | 降级状态 |
-| `GET /api/sessions` | 列出历史会话 |
-| `GET /api/sessions/{id}/history` | 加载会话消息 |
-| `DELETE /api/sessions/{id}` | 删除会话 |
-| `POST /api/knowledge/upload` | 上传 PDF + 触发重建 |
-| `POST /api/knowledge/async/clear-and-rebuild` | 异步清空重建 |
-| `GET /api/knowledge/async/status` | 重建进度 |
+
+| 端点                                          | 说明                        |
+| --------------------------------------------- | --------------------------- |
+| `POST /api/chat`                              | 同步对话                    |
+| `POST /api/chat/stream`                       | **SSE 流式对话** (逐字输出) |
+| `GET /api/degradation/status`                 | 降级状态                    |
+| `GET /api/sessions`                           | 列出历史会话                |
+| `GET /api/sessions/{id}/history`              | 加载会话消息                |
+| `DELETE /api/sessions/{id}`                   | 删除会话                    |
+| `POST /api/knowledge/upload`                  | 上传 PDF + 触发重建         |
+| `POST /api/knowledge/async/clear-and-rebuild` | 异步清空重建                |
+| `GET /api/knowledge/async/status`             | 重建进度                    |
 
 ---
 
@@ -241,24 +246,26 @@ PDF 上传 -> KnowledgeRebuildProducer -> RabbitMQ
 
 ### realtime-service
 
-| Key Pattern | 类型 | TTL | 读写者 | 用途 |
-|-------------|------|-----|--------|------|
-| `wtb:common:real_time_max_wt_id_{wf}` | Integer | 24h | MQTT写入/前端读取 | 风场最大风机编号 |
-| `wtb:common:real_time_fea_curve_{wf}_{t}` | FeaCurveBO | 24h | MQTT写入/前端1s轮询 | 特征曲线 FIFO 队列(20点) |
-| `wtb:common:real_time_latest_file` | Pair | 24h | FTP文件监控写入/前端下载 | 最新振动数据文件路径 |
-| `wtb:common:wind_turbine_wf_status_{wf}` | Map | 24h | 查询时构建/读取 | 风场所有风机状态快照 |
-| `wtb:state:wind_turbine_wt_status_{wf}_{t}` | Integer | **20s** | MQTT每次写/状态查询读 | 单风机实时状态 |
+
+| Key Pattern                                 | 类型       | TTL     | 读写者                   | 用途                     |
+| ------------------------------------------- | ---------- | ------- | ------------------------ | ------------------------ |
+| `wtb:common:real_time_max_wt_id_{wf}`       | Integer    | 24h     | MQTT写入/前端读取        | 风场最大风机编号         |
+| `wtb:common:real_time_fea_curve_{wf}_{t}`   | FeaCurveBO | 24h     | MQTT写入/前端1s轮询      | 特征曲线 FIFO 队列(20点) |
+| `wtb:common:real_time_latest_file`          | Pair       | 24h     | FTP文件监控写入/前端下载 | 最新振动数据文件路径     |
+| `wtb:common:wind_turbine_wf_status_{wf}`    | Map        | 24h     | 查询时构建/读取          | 风场所有风机状态快照     |
+| `wtb:state:wind_turbine_wt_status_{wf}_{t}` | Integer    | **20s** | MQTT每次写/状态查询读    | 单风机实时状态           |
 
 **设计思路**：24h `common` 保底，20s `state` 保实时。读时先查 common 快照，再逐风机查 state 覆盖最新值。
 
 ### agent-service
 
-| Key Pattern | 类型 | TTL | 用途 |
-|-------------|------|-----|------|
-| `chat:memory:{sessionId}` | LangChain4j JSON | 1天 | 当前会话窗口 (N条消息) |
-| `chat:archive:{sessionId}` | LangChain4j JSON | 30天 | 窗口外历史消息归档 |
-| `knowledge:rebuild:status:{id}` | Object | 24h | 知识库重建进度 (前端轮询) |
-| `wind-farm-knowledge` | RediSearch 向量索引 | 持久 | 文档 Embedding (1536维, HNSW) |
+
+| Key Pattern                     | 类型                | TTL  | 用途                          |
+| ------------------------------- | ------------------- | ---- | ----------------------------- |
+| `chat:memory:{sessionId}`       | LangChain4j JSON    | 1天  | 当前会话窗口 (N条消息)        |
+| `chat:archive:{sessionId}`      | LangChain4j JSON    | 30天 | 窗口外历史消息归档            |
+| `knowledge:rebuild:status:{id}` | Object              | 24h  | 知识库重建进度 (前端轮询)     |
+| `wind-farm-knowledge`           | RediSearch 向量索引 | 持久 | 文档 Embedding (1536维, HNSW) |
 
 ---
 
@@ -314,14 +321,15 @@ return 1
 
 `GET /realtime/query` 的 6 个可选参数任意组合：
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| windfarm | String | 风场编号, 如 `10001` |
-| windturbine | Integer | 风机编号 |
-| status | Integer | 0=正常, 1=故障, 9=未连接 |
-| startTime | String | yyyy-MM-dd HH:mm:ss |
-| endTime | String | 同上 |
-| limit | Integer | 默认 50 |
+
+| 参数        | 类型    | 说明                     |
+| ----------- | ------- | ------------------------ |
+| windfarm    | String  | 风场编号, 如`10001`      |
+| windturbine | Integer | 风机编号                 |
+| status      | Integer | 0=正常, 1=故障, 9=未连接 |
+| startTime   | String  | yyyy-MM-dd HH:mm:ss      |
+| endTime     | String  | 同上                     |
+| limit       | Integer | 默认 50                  |
 
 MyBatis 动态 `<if>` 标签按需拼接 WHERE 子句。
 
@@ -333,12 +341,13 @@ MyBatis 动态 `<if>` 标签按需拼接 WHERE 子句。
 
 ## 九、为什么用 Agent？不能手动查询吗？
 
-| 场景 | 手动查 | Agent (LLM + 工具) |
-|------|--------|-------------------|
-| "1号风机最近一周有故障吗" | 需知道接口和参数, 手动拼 | LLM 理解意图, 自动调 `queryRealtimeData(windfarm='10001', windturbine=1, status=1, startTime='...')` |
-| "E-204 是什么故障" | 需手动翻 PDF 知识库 | LLM 自动调 `searchKnowledgeBase(query='E-204')` |
-| 组合查询 | 多次调接口, 人工整合 | LLM 多轮工具调用, 自动归并 |
-| 跨域查询 | 需在不同页面/系统间切换 | Agent 统一入口, 串联知识库+数据库 |
+
+| 场景                      | 手动查                   | Agent (LLM + 工具)                                                                                  |
+| ------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
+| "1号风机最近一周有故障吗" | 需知道接口和参数, 手动拼 | LLM 理解意图, 自动调`queryRealtimeData(windfarm='10001', windturbine=1, status=1, startTime='...')` |
+| "E-204 是什么故障"        | 需手动翻 PDF 知识库      | LLM 自动调`searchKnowledgeBase(query='E-204')`                                                      |
+| 组合查询                  | 多次调接口, 人工整合     | LLM 多轮工具调用, 自动归并                                                                          |
+| 跨域查询                  | 需在不同页面/系统间切换  | Agent 统一入口, 串联知识库+数据库                                                                   |
 
 Agent 用 LLM 的自然语言理解替代了传统"查询表单"——用户不需要知道后端有什么接口、什么参数、怎么组合。这对运维人员尤其是新员工降低了很多使用门槛。
 
@@ -360,16 +369,17 @@ Vue 3 + Vite 5 + ECharts 5 + Vue Router 4 + Axios
 
 ### 环境
 
-| 组件 | 版本 | 端口 |
-|------|------|------|
-| JDK | 17 | - |
-| Maven | 3.8+ | - |
-| MySQL | 5.7+ | 3306 |
-| Redis Stack | 7.x (RediSearch) | 6379 |
-| RabbitMQ | 3.x (MQTT 插件) | 5672/1883 |
-| Nacos | 2.x | 8848 |
-| Node.js | 18+ | 5173 |
-| Python | 3.8+ (模拟器) | - |
+
+| 组件        | 版本             | 端口      |
+| ----------- | ---------------- | --------- |
+| JDK         | 17               | -         |
+| Maven       | 3.8+             | -         |
+| MySQL       | 5.7+             | 3306      |
+| Redis Stack | 7.x (RediSearch) | 6379      |
+| RabbitMQ    | 3.x (MQTT 插件)  | 5672/1883 |
+| Nacos       | 2.x              | 8848      |
+| Node.js     | 18+              | 5173      |
+| Python      | 3.8+ (模拟器)    | -         |
 
 ### 步骤
 
@@ -411,12 +421,13 @@ curl http://localhost:8080/actuator/health              # 网关健康
 
 Nacos 配置中心, Data ID: `{service-name}.yaml`:
 
-| 服务 | Data ID |
-|------|---------|
-| auth-service | `auth-service.yaml` |
+
+| 服务             | Data ID                 |
+| ---------------- | ----------------------- |
+| auth-service     | `auth-service.yaml`     |
 | realtime-service | `realtime-service.yaml` |
-| agent-service | `agent-service.yaml` |
-| api-gateway | `api-gateway.yaml` |
+| agent-service    | `agent-service.yaml`    |
+| api-gateway      | `api-gateway.yaml`      |
 
 - 本地 `application.yml` 为默认值, Nacos 覆盖
 - `refresh-enabled: true` 自动刷新, 改配置无需重启

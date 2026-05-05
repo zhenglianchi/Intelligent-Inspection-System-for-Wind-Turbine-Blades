@@ -143,4 +143,7 @@ public interface RealTimeService {
      * 多条件灵活查询实时数据，所有条件可选
      */
     Result queryByConditions(RealtimeQueryDTO query);
+
+    /** MySQL 直查对比接口，不走Redis */
+    Result queryLastNFromDB(String windfarm, Integer windturbine, Integer N);
 }

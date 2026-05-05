@@ -1,123 +1,111 @@
 """
-MQTT 风机数据模拟器
+MQTT 风机数据模拟器 (19台风机, 异步发送)
 模拟风机设备向 RabbitMQ MQTT 插件发送监测数据
 
-消息格式: id;cyclecount;state;faultcount;cycle;feature1;feature2;feature3;
-- id:          风机编号
-- cyclecount:  循环计数(自增)
-- state:       0=正常 1=故障 2=已连接 9=未连接
-- faultcount:  故障累计次数
-- cycle:       循环周期
-- feature1:    特征值1 (后端会 *13/7 转换)
-- feature2:    特征值2
-- feature3:    特征值3
+每台风机独立 5s 间隔发送，启动时随机错开避免同步
 
-使用前安装依赖: pip install paho-mqtt
+消息格式: id;cyclecount;state;faultcount;cycle;feature1;feature2;feature3;
 """
 
 import paho.mqtt.client as mqtt
 import random
 import time
-import json
+import threading
 from datetime import datetime
 
-# ==================== 配置 ====================
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 MQTT_USERNAME = "guest"
 MQTT_PASSWORD = "guest"
 MQTT_TOPIC = "$share/wind-power-group/windpower/monitoring"
-INTERVAL = 5  # 发送间隔(秒)
+INTERVAL = 5  # 每台风机发送间隔(秒)
+TURBINE_COUNT = 19
 
-# 模拟风机列表: {风机编号: (初始cyclecount, 初始faultcount)}
-TURBINES = {
-    1:  {"cyclecount": 1000, "faultcount": 0, "state": "normal"},
-    2:  {"cyclecount": 2000, "faultcount": 2, "state": "normal"},
-    3:  {"cyclecount": 1500, "faultcount": 0, "state": "normal"},
-}
+turbines = {}
+print_lock = threading.Lock()
 
-# ==================== 连接回调 ====================
+
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ MQTT 连接成功")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT connected")
     else:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ 连接失败, rc={rc}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] MQTT connect failed, rc={rc}")
 
-def on_publish(client, userdata, mid):
-    pass  # 忽略发布确认
 
-# ==================== 消息生成 ====================
-def gen_message(turbine_id, info):
-    """生成一条模拟消息"""
+def gen_message(tid, info):
     info["cyclecount"] += 1
-
-    # 随机状态：95%正常，4%故障，1%未连接
     rand = random.random()
     if rand < 0.95:
-        state = 0  # 正常
+        state = 0
     elif rand < 0.99:
-        state = 1  # 故障
+        state = 1
         info["faultcount"] += 1
     else:
-        state = 9  # 未连接
+        state = 9
 
-    # 特征值：正常时小范围波动，故障时大幅偏离
     if state == 0:
-        f1 = round(random.uniform(0.6, 1.2), 2)
-        f2 = round(random.uniform(0.5, 1.1), 2)
-        f3 = round(random.uniform(0.7, 1.3), 2)
+        f1, f2, f3 = round(random.uniform(0.6, 1.2), 2), round(random.uniform(0.5, 1.1), 2), round(random.uniform(0.7, 1.3), 2)
     elif state == 1:
-        f1 = round(random.uniform(2.0, 4.0), 2)
-        f2 = round(random.uniform(2.0, 4.0), 2)
-        f3 = round(random.uniform(2.0, 4.0), 2)
+        f1, f2, f3 = round(random.uniform(2.0, 4.0), 2), round(random.uniform(2.0, 4.0), 2), round(random.uniform(2.0, 4.0), 2)
     else:
         f1 = f2 = f3 = 0.0
 
-    msg = (
-        f"{turbine_id};"
-        f"{info['cyclecount']};"
-        f"{state};"
-        f"{info['faultcount']};"
-        f"{round(random.uniform(0.8, 1.2), 2)};"
-        f"{f1};{f2};{f3};"
-    )
-    return msg, state
+    return (f"{tid};{info['cyclecount']};{state};{info['faultcount']};"
+            f"{round(random.uniform(0.8, 1.2), 2)};{f1};{f2};{f3};"), state
 
-def state_name(state):
-    return {0: "正常", 1: "故障", 9: "未连接"}.get(state, f"未知({state})")
 
-# ==================== 主循环 ====================
+def state_name(s):
+    return {0: "OK", 1: "FAULT", 9: "OFF"}.get(s, str(s))
+
+
+def turbine_loop(tid, client):
+    """每台风机独立线程，异步发送"""
+    info = {"cyclecount": random.randint(1000, 5000), "faultcount": random.randint(0, 3)}
+    # 随机初始延迟 0~5s，避免所有风机同一时刻发送
+    time.sleep(random.uniform(0, INTERVAL))
+    while True:
+        try:
+            msg, state = gen_message(tid, info)
+            client.publish(MQTT_TOPIC, msg, qos=1)
+            with print_lock:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"[{ts}] turbine {tid:2d} {state_name(state)} [{msg.split(';')[5]},{msg.split(';')[6]},{msg.split(';')[7]}]")
+        except Exception as e:
+            with print_lock:
+                print(f"turbine {tid} error: {e}")
+        time.sleep(INTERVAL)
+
+
 def main():
     client = mqtt.Client()
     client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     client.on_connect = on_connect
-    client.on_publish = on_publish
 
     try:
         client.connect(MQTT_HOST, MQTT_PORT, 60)
         client.loop_start()
         time.sleep(1)
 
-        print(f"🚀 开始模拟 {len(TURBINES)} 台风机，每 {INTERVAL}s 发送一次")
-        print(f"   Topic: {MQTT_TOPIC}")
-        print(f"   风机: {list(TURBINES.keys())}")
+        print(f"Starting {TURBINE_COUNT} turbines (async, {INTERVAL}s each)")
+        print(f"Topic: {MQTT_TOPIC}")
         print("-" * 50)
 
-        while True:
-            for tid, info in TURBINES.items():
-                msg, state = gen_message(tid, info)
-                client.publish(MQTT_TOPIC, msg, qos=1)
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"[{ts}] 📤 风机{tid:2d} | 状态:{state_name(state)} | "
-                      f"特征:[{msg.split(';')[5]},{msg.split(';')[6]},{msg.split(';')[7]}]")
+        threads = []
+        for tid in range(1, TURBINE_COUNT + 1):
+            t = threading.Thread(target=turbine_loop, args=(tid, client), daemon=True)
+            t.start()
+            threads.append(t)
 
-            time.sleep(INTERVAL)
+        # 主线程等待
+        for t in threads:
+            t.join()
 
     except KeyboardInterrupt:
-        print("\n⏹️ 停止模拟")
+        print("\nStopped")
     finally:
         client.loop_stop()
         client.disconnect()
+
 
 if __name__ == "__main__":
     main()
