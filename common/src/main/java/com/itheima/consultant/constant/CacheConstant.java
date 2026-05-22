@@ -24,16 +24,6 @@ public class CacheConstant {
     public static final String CONNECTOR = "_";
 
     /**
-     * 生成风机最新文件缓存Key，按风机ID
-     *
-     * @param windturbine 风机编号
-     * @return 缓存Key
-     */
-    public static String getLatestFileKeyById(String windturbine){
-        return getKey(KEY_REAL_TIME, "wt" + windturbine, "latest_file");
-    }
-
-    /**
      * 生成风机状态缓存Key
      *
      * @param windfarm    风场编号

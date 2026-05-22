@@ -9,6 +9,7 @@ import com.itheima.agent.repository.RedisChatMemoryProvider;
 import com.itheima.agent.service.DegradationService;
 import com.itheima.agent.service.EnhancedRAGService;
 import com.itheima.agent.service.HistoryRetrievalService;
+import com.itheima.agent.service.MemoryManager;
 import dev.langchain4j.agent.tool.Tool;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.data.message.ChatMessage;
@@ -18,6 +19,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
@@ -43,6 +46,15 @@ public class WindFarmDataTools {
     @Autowired
     private WindturbineFeignClient windturbineFeignClient;
 
+    @Autowired
+    private com.itheima.agent.service.ToolResultStore toolResultStore;
+
+    @Autowired
+    private com.itheima.agent.service.MemoryManager memoryManager;
+
+    @Autowired
+    private com.itheima.agent.service.ToolExecutionHooks hooks;
+
     @org.springframework.beans.factory.annotation.Value("${rag.turbine.default-limit:50}")
     private int defaultLimit;
 
@@ -51,7 +63,7 @@ public class WindFarmDataTools {
      * 集成查询改写和 HyDE 功能
      */
     @Tool("检索风电运维知识库。当用户询问以下内容时必须调用此工具：" +
-            "1. 故障代码（如 E-204、E-205 等）的含义和处理方法；" +
+            "1. 故障代码的含义和处理方法；" +
             "2. 风机部件（叶片、齿轮箱、发电机、变桨系统等）的故障排查；" +
             "3. 技术参数、运维流程、操作规范；" +
             "4. 风电行业标准、技术规范；" +
@@ -61,18 +73,15 @@ public class WindFarmDataTools {
             @P("用户的搜索查询语句，应包含关键词，如故障代码、部件名称、技术术语等") String query
     ) {
         log.info("🔍 [RAG Tool] 触发知识库检索，原始查询：{}", query);
-
-        // 降级检查：如果工具已禁用，直接返回降级提示
-        if (!degradationService.isToolAvailable()) {
-            log.warn("⚠️ [降级] 工具调用已禁用，无法执行知识库检索");
-            return "当前系统处于降级模式，知识库检索工具暂不可用。请稍后再试。";
-        }
+        if (hooks.shouldBypass()) return hooks.bypassMessage("知识库检索");
+        if (hooks.isStepLimitReached()) return hooks.stepLimitMessage();
 
         try {
             EnhancedRAGService.EnhancedRAGResult result = enhancedRAGService.retrieveWithDetails(query);
 
             if (result.contents() == null || result.contents().isEmpty()) {
                 log.warn("⚠️ [RAG Tool] 知识库未检索到相关内容");
+                hooks.recordSuccess();
                 return "未在知识库中找到与 '" + query + "' 相关的信息。请尝试使用其他关键词搜索，或联系技术支持。";
             }
 
@@ -98,11 +107,12 @@ public class WindFarmDataTools {
             log.info("✅ [RAG Tool] 检索完成，返回 {} 条片段，耗时 {} ms",
                     result.totalContents(), result.durationMs());
 
-            return resultBuilder.toString();
+            hooks.recordSuccess();
+            String finalResult = resultBuilder.toString();
+            return compactToolResult("searchKnowledgeBase", query, finalResult);
 
         } catch (Exception e) {
-            log.error("❌ [RAG Tool] 知识库检索执行失败", e);
-            return "知识库检索服务暂时不可用，请稍后重试。";
+            return hooks.recordFailure("知识库检索", e);
         }
     }
 
@@ -124,24 +134,20 @@ public class WindFarmDataTools {
             "5. 所有参数均为可选，不传则不作为过滤条件。")
     public String queryRealtimeData(
             @P("风场编号，字符串如'10001'，不填则不限风场") String windfarm,
-            @P("风机编号，整数如1、2、3，不填则不限风机") String windturbine,
-            @P("状态码，0正常/1故障/9未连接，不填则不限状态") String status,
-            @P("开始时间，格式yyyy-MM-dd HH:mm:ss，默认为当天00:00:00") String startTime,
-            @P("结束时间，格式yyyy-MM-dd HH:mm:ss，默认为当前时间") String endTime,
-            @P("返回条数上限，默认50") String limit
+            @P(value = "风机编号，整数如1、2、3，不填则不限风机", required = false) String windturbine,
+            @P(value = "状态码，0正常/1故障/9未连接，不填则不限状态", required = false) String status,
+            @P(value = "开始时间，格式yyyy-MM-dd HH:mm:ss，默认为当天00:00:00", required = false) String startTime,
+            @P(value = "结束时间，格式yyyy-MM-dd HH:mm:ss，默认为当前时间", required = false) String endTime,
+            @P(value = "返回条数上限，默认50", required = false) String limit
     ) {
         log.info("📊 [Data Tool] 多条件查询 - 风场:{}, 风机:{}, 状态:{}, 时间:{}-{}",
                 windfarm, windturbine, status, startTime, endTime);
-
-        if (!degradationService.isToolAvailable()) {
-            return "当前系统处于降级模式，数据查询工具暂不可用。请稍后再试。";
-        }
+        if (hooks.shouldBypass()) return hooks.bypassMessage("数据查询");
+        if (hooks.isStepLimitReached()) return hooks.stepLimitMessage();
 
         try {
             Integer limitVal = parseOrNull(limit);
-            if (limitVal == null || limitVal <= 0) {
-                limitVal = defaultLimit;
-            }
+            if (limitVal == null || limitVal <= 0) limitVal = defaultLimit;
 
             Integer wtVal = parseOrNull(windturbine);
             Integer stVal = parseOrNull(status);
@@ -150,19 +156,23 @@ public class WindFarmDataTools {
                     windfarm, wtVal, stVal, startTime, endTime, limitVal);
 
             if (result == null || !Result.Status.SUCCESS.getCode().equals(result.getStatus())) {
+                hooks.recordSuccess(); // 工具执行了但外部服务返回错误
                 return "查询失败：" + (result != null ? result.getMessage() : "服务无响应");
             }
 
             List<RealtimeDO> records = result.getData();
             if (records == null || records.isEmpty()) {
+                hooks.recordSuccess();
                 return buildEmptyResultMessage(windfarm, wtVal, stVal, startTime, endTime);
             }
 
-            return formatResultTable(records);
+            hooks.recordSuccess();
+            String formatted = formatResultTable(records);
+            return compactToolResult("queryRealtimeData",
+                    String.format("windfarm=%s,windturbine=%s,status=%s", windfarm, windturbine, status), formatted);
 
         } catch (Exception e) {
-            log.error("❌ [Data Tool] 查询执行出错", e);
-            return "查询执行出错：" + e.getMessage();
+            return hooks.recordFailure("数据查询", e);
         }
     }
 
@@ -216,10 +226,12 @@ public class WindFarmDataTools {
         // 降级检查：如果工具已禁用，直接返回降级提示
         if (!degradationService.isToolAvailable()) {
             log.warn("⚠️ [降级] 工具调用已禁用，无法获取聊天历史");
+            hooks.recordSuccess();
             return "当前系统处于降级模式，历史查询工具暂不可用。请稍后再试。";
         }
 
         if (userId == null) {
+            hooks.recordSuccess();
             return "错误：无法获取当前用户身份。";
         }
 
@@ -227,11 +239,15 @@ public class WindFarmDataTools {
             List<ChatMessage> history = chatMemoryProvider.getFullHistory(userId);
 
             if (history.isEmpty()) {
+                hooks.recordSuccess();
                 return "当前用户暂无历史聊天记录。";
             }
 
-            return ChatMessageSerializer.messagesToJson(history);
+            hooks.recordSuccess();
+            String result = ChatMessageSerializer.messagesToJson(history);
+            return compactToolResult("getChatHistory", userId, result);
         } catch (Exception e) {
+            hooks.recordFailureOnly();
             log.error("❌ [History Tool] 获取历史记录失败", e);
             return "获取历史记录失败: " + e.getMessage();
         }
@@ -251,20 +267,25 @@ public class WindFarmDataTools {
         // 降级检查
         if (!degradationService.isToolAvailable()) {
             log.warn("⚠️ [降级] 工具调用已禁用，无法检索历史");
+            hooks.recordSuccess();
             return "当前系统处于降级模式，历史检索工具暂不可用。请稍后再试。";
         }
 
         if (userId == null) {
+            hooks.recordSuccess();
             return "错误：无法获取当前用户身份。";
         }
 
         try {
             String result = historyRetrievalService.retrieveRelevantHistory(userId, query);
             if (result.isEmpty()) {
+                hooks.recordSuccess();
                 return "未找到与 '" + query + "' 相关的历史对话。";
             }
-            return result;
+            hooks.recordSuccess();
+            return compactToolResult("searchRelevantHistory", query, result);
         } catch (Exception e) {
+            hooks.recordFailureOnly();
             log.error("❌ [History Search] 检索相关历史失败", e);
             return "检索相关历史失败: " + e.getMessage();
         }
@@ -282,17 +303,20 @@ public class WindFarmDataTools {
 
         if (!degradationService.isToolAvailable()) {
             log.warn("⚠️ [降级] 工具调用已禁用");
+            hooks.recordSuccess();
             return "当前系统处于降级模式，该工具暂不可用。请稍后再试。";
         }
 
         try {
             if (windfarm == null || windfarm.trim().isEmpty()) {
+                hooks.recordSuccess();
                 return "错误：必须提供风场名称。";
             }
 
             Result<Map<String, Integer>> result = windturbineFeignClient.queryAllWindturbineStatus(windfarm);
 
             if (result == null || !Result.Status.SUCCESS.getCode().equals(result.getStatus())) {
+                hooks.recordSuccess();
                 return "查询失败：" + (result != null ? result.getMessage() : "服务无响应");
             }
 
@@ -347,11 +371,179 @@ public class WindFarmDataTools {
             log.info("✅ [Windturbine Tool] 查询完成，{} 台风机，正常:{}, 故障:{}, 离线:{}",
                     statusMap.size(), normalCount, faultCount, offlineCount);
 
-            return sb.toString();
+            hooks.recordSuccess();
+            String statusText = sb.toString();
+            return compactToolResult("queryAllWindturbineStatus", windfarm, statusText);
 
         } catch (Exception e) {
+            hooks.recordFailureOnly();
             log.error("❌ [Windturbine Tool] 查询执行出错", e);
             return "查询执行出错：" + e.getMessage();
+        }
+    }
+
+    // ---- 辅助方法 ----
+
+    /** 工具结果超过此长度时自动保存完整数据到磁盘，返回结构化摘要 */
+    private static final int TOOL_RESULT_MAX_CHARS = 500;
+
+    /**
+     * 保存完整工具结果到磁盘，若结果过大则返回结构化摘要 + 文件路径引用。
+     * 摘要保留前 400 字符关键信息 + 行数统计，LLM 可按需用 readToolResultFile 读取指定行范围。
+     */
+    private String compactToolResult(String toolName, String params, String result) {
+        if (result == null) return null;
+        try {
+            String sessionId = MemoryIdContext.get();
+            if (sessionId == null) sessionId = "unknown";
+            // 始终保存完整结果到磁盘
+            String filePath = toolResultStore.save(sessionId, toolName, params, result);
+            if (filePath == null) return result;
+
+            if (result.length() > TOOL_RESULT_MAX_CHARS) {
+                int lineCount = result.split("\n").length;
+                // 结构化摘要：保留前 400 字符 + 统计信息 + 文件引用
+                String preview = result.substring(0, Math.min(400, result.length()));
+                // 截断到最后一个完整行
+                int lastNewline = preview.lastIndexOf('\n');
+                if (lastNewline > 200) preview = preview.substring(0, lastNewline);
+
+                log.info("[ToolResult] 结果过大 ({} chars, {} lines), 生成摘要并归档: {}",
+                        result.length(), lineCount, filePath);
+                return String.format(
+                    "%s\n\n[数据摘要] 工具: %s | 总字符: %d | 总行数: %d | 文件: %s\n"
+                    + "以上为结果预览。如需查看完整数据或特定行范围，请调用 readToolResultFile 工具并指定文件路径和行范围。",
+                    preview, toolName, result.length(), lineCount, filePath);
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("记录工具结果失败: {}", e.getMessage());
+            return result;
+        }
+    }
+
+    // ---- 工具 7: 读取磁盘存储的工具结果文件 ----
+
+    @Tool("读取之前工具调用的完整结果文件。支持按行范围读取，避免一次性加载过大文件。" +
+          "文件路径在工具返回的摘要信息中提供。指定 startLine 和 endLine 可仅读取部分行（1-indexed，含两端）。")
+    public String readToolResultFile(
+            @P("要读取的文件路径，例如 data/tool_results/session123/20260519_143000_searchKnowledgeBase.csv") String filePath,
+            @P("起始行号（1-indexed，可选，不填则从第1行开始）") String startLine,
+            @P("结束行号（1-indexed，可选，不填则读到文件末尾）") String endLine
+    ) {
+        log.info("📄 [File Tool] 读取工具结果文件: {}, 行范围: {}-{}", filePath, startLine, endLine);
+        try {
+            Path path = Path.of(filePath);
+            if (!Files.exists(path)) {
+                return "文件不存在: " + filePath;
+            }
+            List<String> allLines = Files.readAllLines(path);
+            int totalLines = allLines.size();
+
+            int start = 1;
+            int end = totalLines;
+            try {
+                if (startLine != null && !startLine.isEmpty()) start = Integer.parseInt(startLine);
+                if (endLine != null && !endLine.isEmpty()) end = Integer.parseInt(endLine);
+            } catch (NumberFormatException ignored) {}
+
+            start = Math.max(1, Math.min(start, totalLines));
+            end = Math.max(start, Math.min(end, totalLines));
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("文件: %s | 总行数: %d | 当前读取: %d-%d 行\n\n", filePath, totalLines, start, end));
+            for (int i = start - 1; i < end; i++) {
+                sb.append(String.format("%6d| %s\n", i + 1, allLines.get(i)));
+            }
+
+            hooks.recordSuccess();
+            String result = sb.toString();
+            return compactToolResult("readToolResultFile", filePath, result);
+        } catch (Exception e) {
+            hooks.recordFailureOnly();
+            return "读取文件失败: " + e.getMessage();
+        }
+    }
+
+    // ---- 工具 8: 保存记忆 ----
+
+    @Tool("保存一条持久化记忆，支持四种类型：" +
+          "1. user - 用户角色、偏好、知识背景；" +
+          "2. feedback - 用户对助手行为的反馈（应做/不应做）；" +
+          "3. project - 项目上下文、截止日期、决策；" +
+          "4. reference - 外部系统引用、链接、资源位置。" +
+          "当用户明确要求记住某事、给出行为反馈、或提及重要的项目信息时使用。")
+    public String saveMemory(
+            @P("记忆名称，短横线命名，如 user-role、feedback-testing") String name,
+            @P("记忆类型: user, feedback, project, reference") String type,
+            @P("一句话描述，用于索引检索") String description,
+            @P("记忆正文内容") String content
+    ) {
+        log.info("🧠 [Memory] 保存记忆: name={}, type={}", name, type);
+        try {
+            MemoryManager.MemoryType memType;
+            try {
+                memType = MemoryManager.MemoryType.valueOf(type.toUpperCase());
+            } catch (IllegalArgumentException e) {
+                return "无效的记忆类型: " + type + "，可选值: user, feedback, project, reference";
+            }
+            String sid = MemoryIdContext.get(); if (sid == null) sid = "unknown";
+            MemoryManager.MemoryEntry entry = memoryManager.saveMemory(sid, name, description, memType, content);
+            hooks.recordSuccess();
+            String msg = entry != null
+                    ? "记忆已保存: " + name + " (" + type + ")"
+                    : "记忆保存失败";
+            return compactToolResult("saveMemory", name + "," + type, msg);
+        } catch (Exception e) {
+            hooks.recordFailureOnly();
+            return "保存记忆失败: " + e.getMessage();
+        }
+    }
+
+    // ---- 工具 9: 更新记忆 ----
+
+    @Tool("更新一条已有的记忆。当用户说'我之前说的是...'、'改一下我的偏好'、'修正之前的记录'等需要修改已保存记忆时使用。" +
+          "如果只改内容，保留原有描述；如果描述也变了，传入新的描述。")
+    public String updateMemory(
+            @P("要更新的记忆名称") String name,
+            @P("新的记忆正文内容") String newContent,
+            @P("新的描述（可选，不填则保留原有描述）") String newDescription
+    ) {
+        log.info("✏️ [Memory] 更新记忆: name={}", name);
+        try {
+            MemoryManager.MemoryEntry entry;
+            String sid = MemoryIdContext.get(); if (sid == null) sid = "unknown";
+            if (newDescription != null && !newDescription.trim().isEmpty()) {
+                entry = memoryManager.updateMemory(sid, name, newDescription.trim(), newContent);
+            } else {
+                entry = memoryManager.updateMemory(sid, name, newContent);
+            }
+            hooks.recordSuccess();
+            if (entry == null) {
+                return "未找到记忆: " + name + "，请先使用 saveMemory 创建。";
+            }
+            return compactToolResult("updateMemory", name, "记忆已更新: " + name + " (" + entry.getType() + ")");
+        } catch (Exception e) {
+            hooks.recordFailureOnly();
+            return "更新记忆失败: " + e.getMessage();
+        }
+    }
+
+    // ---- 工具 10: 删除记忆 ----
+
+    @Tool("删除一条已保存的记忆。当用户明确说'删除...记忆'、'忘掉...'时使用。")
+    public String deleteMemory(
+            @P("要删除的记忆名称") String name
+    ) {
+        log.info("🗑️ [Memory] 删除记忆: {}", name);
+        try {
+            String sid = MemoryIdContext.get(); if (sid == null) sid = "unknown";
+            boolean ok = memoryManager.deleteMemory(sid, name);
+            hooks.recordSuccess();
+            return ok ? "记忆已删除: " + name : "未找到记忆: " + name;
+        } catch (Exception e) {
+            hooks.recordFailureOnly();
+            return "删除记忆失败: " + e.getMessage();
         }
     }
 

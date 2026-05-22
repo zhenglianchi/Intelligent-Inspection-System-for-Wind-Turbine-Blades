@@ -1,17 +1,12 @@
 package com.itheima.agent.pojo;
 
+/**
+ * 跨线程传递 memoryId — InheritableThreadLocal 保证子线程（工具调用）也能读到。
+ */
 public class MemoryIdContext {
-    private static final ThreadLocal<String> CURRENT_MEMORY_ID = new ThreadLocal<>();
+    private static final InheritableThreadLocal<String> CTX = new InheritableThreadLocal<>();
 
-    public static void set(String id) {
-        CURRENT_MEMORY_ID.set(id);
-    }
-
-    public static String get() {
-        return CURRENT_MEMORY_ID.get();
-    }
-
-    public static void clear() {
-        CURRENT_MEMORY_ID.remove();
-    }
+    public static void set(String id) { CTX.set(id); }
+    public static String get() { return CTX.get(); }
+    public static void clear() { CTX.remove(); }
 }

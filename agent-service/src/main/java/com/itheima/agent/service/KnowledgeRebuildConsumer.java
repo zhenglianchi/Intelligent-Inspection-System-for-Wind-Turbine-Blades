@@ -97,6 +97,21 @@ public class KnowledgeRebuildConsumer {
             log.info("✅ 旧索引 [{}] 及向量数据删除成功", indexName);
         }
 
+        // 清理旧父子索引、缓存、BM25
+        sendProgressUpdate(task.getTaskId(), task.getTaskType(), 15, "正在清理旧数据...");
+        try {
+            var parentKeys = redisTemplate.keys("doc:parent:*");
+            var cacheKeys = redisTemplate.keys("rag:cache:semantic:*");
+            var bm25Keys = redisTemplate.keys("rag:bm25:*");
+            int cleared = 0;
+            if (parentKeys != null && !parentKeys.isEmpty()) { redisTemplate.delete(parentKeys); cleared += parentKeys.size(); }
+            if (cacheKeys != null && !cacheKeys.isEmpty()) { redisTemplate.delete(cacheKeys); cleared += cacheKeys.size(); }
+            if (bm25Keys != null && !bm25Keys.isEmpty()) { redisTemplate.delete(bm25Keys); cleared += bm25Keys.size(); }
+            if (cleared > 0) log.info("✅ 清理旧数据 {} 条 (父子索引/缓存/BM25)", cleared);
+        } catch (Exception e) {
+            log.warn("清理旧数据异常: {}", e.getMessage());
+        }
+
         sendProgressUpdate(task.getTaskId(), task.getTaskType(), 20, "正在加载文档...");
         log.info("🚀 开始重新加载 PDF 并构建新索引...");
 

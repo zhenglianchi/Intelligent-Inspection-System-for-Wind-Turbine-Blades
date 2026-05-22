@@ -1,0 +1,25 @@
+# Maven
+target/
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & data
+*.log
+data/tool_results/
+data/logs/
+data/chat_history/
+data/chat_summaries/
+data/metrics/
+
+# Node
+node_modules/
+dist/

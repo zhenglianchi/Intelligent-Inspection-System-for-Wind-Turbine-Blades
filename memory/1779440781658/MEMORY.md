@@ -1,0 +1,1 @@
+- [user-role-preference.md](user-role-preference.md) — 用户职业背景及信息接收偏好

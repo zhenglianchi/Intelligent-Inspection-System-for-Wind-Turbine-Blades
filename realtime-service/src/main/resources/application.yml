@@ -60,25 +60,6 @@ mqtt:
 realtime:
   feacurve:
     capacity: 20
-  ftp:
-    root-dir: /home/bupt314/FtpCenter
-    normal:
-      delete: true
-  dataLength: 200000
-  downsample:
-    open: true
-    ratio: 50
-  spectrum:
-    segment:
-      num: 20
-    downsample:
-      open: false
-      ratio: 2
-    out:
-      downsample:
-        ratio: 1
-  log:
-    open: true
 
 mybatis:
   configuration:

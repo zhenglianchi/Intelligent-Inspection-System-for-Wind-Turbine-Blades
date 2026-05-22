@@ -1,8 +1,13 @@
 package com.itheima.agent.service;
 
+import com.itheima.agent.metrics.RagMetrics;
+import com.itheima.agent.metrics.SessionMetricsTracker;
+import com.itheima.agent.pojo.MemoryIdContext;
 import com.itheima.agent.retriever.HybridRerankRetriever;
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.query.Query;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -11,192 +16,146 @@ import org.springframework.stereotype.Service;
 import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * 增强RAG服务
- * 通过查询改写(Query Rewrite)和假设文档生成(HyDE)技术提升检索效果
- *
- * Query Rewrite：将原始问题扩展为多个相关查询，提高召回率
- * HyDE (Hypothetical Document Embeddings)：先生成一个假设的回答文档，
- *      然后用这个文档去检索，能更好地匹配语义相似的真实文档
- */
 @Slf4j
 @Service
 public class EnhancedRAGService {
 
-    // 查询改写服务
-    @Autowired
-    private QueryRewriteService queryRewriteService;
+    @Autowired private QueryRewriteService queryRewriteService;
+    @Autowired private HyDEService hydeService;
+    @Autowired private HybridRerankRetriever hybridRerankRetriever;
+    @Autowired private DegradationService degradationService;
+    @Autowired private RagResultCacheService ragCache;
+    @Autowired private EmbeddingModel embeddingModel;
+    @Autowired private RagMetrics ragMetrics;
+    @Autowired private SessionMetricsTracker sessionMetrics;
 
-    // HyDE假设文档生成服务
-    @Autowired
-    private HyDEService hydeService;
+    @Value("${rag.enhanced.enabled:true}") private boolean enabled;
+    @Value("${rag.enhanced.use-query-rewrite:true}") private boolean useQueryRewrite;
+    @Value("${rag.enhanced.use-hyde:true}") private boolean useHyde;
+    @Value("${rag.enhanced.merge-strategy:UNION}") private String mergeStrategy;
 
-    // 混合检索重排序器
-    @Autowired
-    private HybridRerankRetriever hybridRerankRetriever;
-
-    // 降级服务
-    @Autowired
-    private DegradationService degradationService;
-
-    // 是否启用增强RAG
-    @Value("${rag.enhanced.enabled:true}")
-    private boolean enabled;
-
-    // 是否启用查询改写
-    @Value("${rag.enhanced.use-query-rewrite:true}")
-    private boolean useQueryRewrite;
-
-    // 是否启用HyDE
-    @Value("${rag.enhanced.use-hyde:true}")
-    private boolean useHyde;
-
-    // 多查询结果合并策略：UNION(并集)/INTERSECTION(交集)/FIRST_ONLY(仅第一个)
-    @Value("${rag.enhanced.merge-strategy:UNION}")
-    private String mergeStrategy;
-
-    /**
-     * 增强RAG检索入口
-     * @param originalQuery 原始用户查询
-     * @return 检索到的相关内容列表
-     */
     public List<Content> retrieve(String originalQuery) {
-        log.info("🚀 [增强RAG] 开始检索，原始查询: {}", originalQuery);
-
-        // 降级检查：如果RAG已禁用，直接返回空结果
+        log.info("[增强RAG] 检索: {}", originalQuery);
         if (!degradationService.isRagAvailable()) {
-            log.warn("⚠️ [降级] RAG服务已禁用，跳过检索");
+            log.warn("[降级] RAG 已禁用");
             return Collections.emptyList();
         }
 
-        if (!enabled) {
-            return hybridRerankRetriever.retrieve(new Query(originalQuery));
+        // 缓存检查 (带计时)
+        Timer.Sample cacheSample = Timer.start();
+        if (ragCache.isEnabled()) {
+            try {
+                String queryMd5 = ragCache.md5(originalQuery);
+                float[] queryEmbedding = embeddingModel.embed(originalQuery).content().vector();
+                String cached = ragCache.findSimilarQuery(queryEmbedding, queryMd5);
+                if (cached != null) {
+                    ragMetrics.recordCacheCheck(cacheSample);
+                    log.info("[增强RAG] 缓存命中");
+                    return List.of(Content.from(cached));
+                }
+            } catch (Exception e) { log.debug("缓存查询失败: {}", e.getMessage()); }
         }
+        ragMetrics.recordCacheCheck(cacheSample);
+
+        if (!enabled) return hybridRerankRetriever.retrieve(new Query(originalQuery));
 
         List<String> searchQueries = new ArrayList<>();
         searchQueries.add(originalQuery);
 
         if (useQueryRewrite) {
             QueryRewriteService.RewriteResult rewriteResult = queryRewriteService.process(originalQuery);
-            if (rewriteResult.expandedQueries() != null) {
-                searchQueries.addAll(rewriteResult.expandedQueries());
-            }
-            log.info("📝 [增强RAG] 查询改写后共 {} 个检索查询", searchQueries.size());
+            if (rewriteResult.expandedQueries() != null) searchQueries.addAll(rewriteResult.expandedQueries());
         }
-
         if (useHyde) {
             HyDEService.HyDEResult hydeResult = hydeService.process(originalQuery);
-            if (hydeResult.hasHypotheticalDoc()) {
-                searchQueries.addAll(hydeResult.hypotheticalDocuments());
-                log.info("📄 [增强RAG] HyDE 生成了 {} 个假设文档", hydeResult.hypotheticalDocuments().size());
-            }
+            if (hydeResult.hasHypotheticalDoc()) searchQueries.addAll(hydeResult.hypotheticalDocuments());
         }
 
         searchQueries = searchQueries.stream().distinct().toList();
-        log.info("🔍 [增强RAG] 最终检索查询数: {}", searchQueries.size());
 
+        // 向量检索 (含 embedding + vector search + BM25 + rerank)
+        Timer.Sample retrieveSample = Timer.start();
         List<Content> allContents = new ArrayList<>();
         Map<String, Content> contentMap = new LinkedHashMap<>();
-
         for (String query : searchQueries) {
             try {
                 List<Content> contents = hybridRerankRetriever.retrieve(new Query(query));
-
                 switch (mergeStrategy.toUpperCase()) {
-                    case "UNION":
-                        for (Content content : contents) {
-                            String key = content.textSegment().text();
-                            if (!contentMap.containsKey(key)) {
-                                contentMap.put(key, content);
-                            }
+                    case "UNION" -> contents.forEach(c -> contentMap.putIfAbsent(c.textSegment().text(), c));
+                    case "INTERSECTION" -> {
+                        if (allContents.isEmpty()) contents.forEach(c -> contentMap.put(c.textSegment().text(), c));
+                        else {
+                            Set<String> keys = contents.stream().map(c -> c.textSegment().text()).collect(Collectors.toSet());
+                            contentMap.keySet().retainAll(keys);
                         }
-                        break;
-                    case "INTERSECTION":
-                        if (allContents.isEmpty()) {
-                            contents.forEach(c -> contentMap.put(c.textSegment().text(), c));
-                        } else {
-                            Set<String> currentKeys = contents.stream()
-                                    .map(c -> c.textSegment().text())
-                                    .collect(Collectors.toSet());
-                            contentMap.keySet().retainAll(currentKeys);
-                        }
-                        break;
-                    case "FIRST_ONLY":
-                        if (allContents.isEmpty()) {
-                            contents.forEach(c -> contentMap.put(c.textSegment().text(), c));
-                        }
-                        break;
-                    default:
-                        contents.forEach(c -> contentMap.put(c.textSegment().text(), c));
+                    }
+                    case "FIRST_ONLY" -> { if (allContents.isEmpty()) contents.forEach(c -> contentMap.put(c.textSegment().text(), c)); }
+                    default -> contents.forEach(c -> contentMap.put(c.textSegment().text(), c));
                 }
-
-            } catch (Exception e) {
-                log.error("❌ [增强RAG] 查询 '{}' 检索失败", query, e);
-            }
+            } catch (Exception e) { log.error("[增强RAG] '{}' 检索失败", query, e); }
         }
-
         allContents = new ArrayList<>(contentMap.values());
+        ragMetrics.recordTotalRetrieve(retrieveSample);
 
-        log.info("✅ [增强RAG] 检索完成，合并后共 {} 条内容", allContents.size());
+        // 写入缓存
+        if (ragCache.isEnabled() && !allContents.isEmpty()) {
+            try {
+                String queryMd5 = ragCache.md5(originalQuery);
+                String resultText = allContents.stream().map(c -> c.textSegment().text()).collect(Collectors.joining("\n---\n"));
+                float[] queryEmbedding = embeddingModel.embed(originalQuery).content().vector();
+                ragCache.cacheResult(queryMd5, originalQuery, resultText, queryEmbedding);
+            } catch (Exception e) { log.warn("缓存写入失败: {}", e.getMessage()); }
+        }
 
         return allContents;
     }
 
-    /**
-     * 增强RAG检索，返回详细信息（包括改写查询、HyDE文档等）用于调试和监控
-     * @param originalQuery 原始用户查询
-     * @return 包含检索过程详细信息的结果对象
-     */
+    /** 增强RAG检索 + 详细结果 (被 @Tool searchKnowledgeBase 调用) */
     public EnhancedRAGResult retrieveWithDetails(String originalQuery) {
-        long startTime = System.currentTimeMillis();
+        long t0 = System.nanoTime();
 
+        // 查询改写计时
+        long embMs = 0;
         String rewrittenQuery = originalQuery;
         List<String> expandedQueries = List.of();
-        List<String> hypotheticalDocs = List.of();
-
         if (useQueryRewrite) {
+            long t1 = System.nanoTime();
             QueryRewriteService.RewriteResult rewriteResult = queryRewriteService.process(originalQuery);
             rewrittenQuery = rewriteResult.rewrittenQuery();
             expandedQueries = rewriteResult.expandedQueries();
+            embMs += (System.nanoTime() - t1) / 1_000_000;
         }
 
+        // HyDE 计时
+        List<String> hypotheticalDocs = List.of();
         if (useHyde) {
+            long t2 = System.nanoTime();
             HyDEService.HyDEResult hydeResult = hydeService.process(originalQuery);
             hypotheticalDocs = hydeResult.hypotheticalDocuments();
+            embMs += (System.nanoTime() - t2) / 1_000_000;
         }
 
+        // 总检索计时 (内含 embedding + vector + BM25 + rerank)
+        long t3 = System.nanoTime();
         List<Content> contents = retrieve(originalQuery);
+        long retrieveMs = (System.nanoTime() - t3) / 1_000_000;
+        long totalMs = (System.nanoTime() - t0) / 1_000_000;
 
-        long duration = System.currentTimeMillis() - startTime;
+        // 记录到 session 级指标
+        String sid = MemoryIdContext.get();
+        if (sid != null) {
+            sessionMetrics.recordRagPipeline(sid, embMs, 0, 0, 0, 0, totalMs);
+        }
 
-        return new EnhancedRAGResult(
-                originalQuery,
-                rewrittenQuery,
-                expandedQueries,
-                hypotheticalDocs,
-                contents,
-                duration
-        );
+        return new EnhancedRAGResult(originalQuery, rewrittenQuery, expandedQueries, hypotheticalDocs, contents, totalMs);
     }
 
     public record EnhancedRAGResult(
-            String originalQuery,
-            String rewrittenQuery,
-            List<String> expandedQueries,
-            List<String> hypotheticalDocuments,
-            List<Content> contents,
-            long durationMs
-    ) {
-        public int totalContents() {
-            return contents != null ? contents.size() : 0;
-        }
-
-        public boolean hasRewrite() {
-            return !originalQuery.equals(rewrittenQuery);
-        }
-
-        public boolean hasHyDE() {
-            return hypotheticalDocuments != null && !hypotheticalDocuments.isEmpty();
-        }
+            String originalQuery, String rewrittenQuery,
+            List<String> expandedQueries, List<String> hypotheticalDocuments,
+            List<Content> contents, long durationMs) {
+        public int totalContents() { return contents != null ? contents.size() : 0; }
+        public boolean hasRewrite() { return !originalQuery.equals(rewrittenQuery); }
+        public boolean hasHyDE() { return hypotheticalDocuments != null && !hypotheticalDocuments.isEmpty(); }
     }
 }

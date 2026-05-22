@@ -1,6 +1,9 @@
 package com.itheima.agent.retriever;
 
 import com.hankcs.hanlp.HanLP;
+import com.itheima.agent.metrics.RagMetrics;
+import com.itheima.agent.metrics.SessionMetricsTracker;
+import com.itheima.agent.pojo.MemoryIdContext;
 import com.itheima.agent.service.AliyunRerankService;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
@@ -10,6 +13,7 @@ import dev.langchain4j.rag.query.Query;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,6 +23,7 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
+import java.util.Map.Entry;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -43,6 +48,12 @@ public class HybridRerankRetriever implements ContentRetriever {
     @Autowired
     private EmbeddingModel embeddingModel;
 
+    @Autowired
+    private RagMetrics ragMetrics;
+
+    @Autowired
+    private SessionMetricsTracker sessionMetrics;
+
     // 阿里云重排序服务（对候选文档进行语义相关性重排序）
     @Autowired
     private AliyunRerankService rerankService;
@@ -50,6 +61,10 @@ public class HybridRerankRetriever implements ContentRetriever {
     // Redis模板（用于执行RediSearch关键词检索）
     @Autowired
     private StringRedisTemplate redisTemplate;
+
+    // BM25 关键词检索器 (可选，未建索引时回退到 RediSearch 通配符)
+    @Autowired(required = false)
+    private BM25KeywordRetriever bm25Retriever;
 
     // 向量检索召回的最大候选数
     @Value("${rag.retrieval.top-k-recall:30}")
@@ -110,7 +125,9 @@ public class HybridRerankRetriever implements ContentRetriever {
 
             // 步骤2: 调用阿里云GTE-Rerank进行语义重排序
             log.info("🔄 [Rerank] 正在调用阿里云 GTE-Rerank...");
+            Timer.Sample rerankSample = Timer.start();
             List<AliyunRerankService.RerankResult> rerankedResults = rerankService.rerank(query.text(), candidateTexts);
+            ragMetrics.recordRerank(rerankSample);
 
             // 步骤3: 根据重排序分数过滤，只保留分数高于阈值的前topKFinal个文档
             List<Content> ragContents = rerankedResults.stream()
@@ -193,19 +210,37 @@ public class HybridRerankRetriever implements ContentRetriever {
      * @return 排序后的候选文档列表
      */
     private List<ScoredDocument> vectorSearch(Query query) {
+        Timer.Sample embSample = Timer.start();
+        var queryEmbedding = embeddingModel.embed(query.text()).content();
+        ragMetrics.recordEmbedding(embSample);
+
+        Timer.Sample vecSample = Timer.start();
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
-                .queryEmbedding(embeddingModel.embed(query.text()).content())
+                .queryEmbedding(queryEmbedding)
                 .maxResults(topKRecall)
                 .minScore(minScore)
                 .build();
 
-        return embeddingStore.search(request).matches().stream()
-                .map(match -> new ScoredDocument(
-                        match.embedded().text(),
-                        match.score(),
-                        extractDocId(match)
-                ))
+        List<ScoredDocument> results = embeddingStore.search(request).matches().stream()
+                .map(match -> {
+                    String text = match.embedded().text();
+                    String docId = extractDocId(match);
+
+                    // 父子索引：如果命中子chunk，反查父chunk全文作为上下文
+                    String parentId = match.embedded().metadata() != null
+                            ? match.embedded().metadata().getString("parent_id") : null;
+                    if (parentId != null && !parentId.isEmpty()) {
+                        String parentText = redisTemplate.opsForValue().get("doc:parent:" + parentId);
+                        if (parentText != null && !parentText.isEmpty()) {
+                            text = parentText;
+                        }
+                    }
+                    return new ScoredDocument(text, match.score(), docId);
+                })
                 .collect(Collectors.toList());
+
+        ragMetrics.recordVectorSearch(vecSample);
+        return results;
     }
 
     /**
@@ -220,11 +255,29 @@ public class HybridRerankRetriever implements ContentRetriever {
     private List<ScoredDocument> keywordSearch(Query query) {
         long startTime = System.currentTimeMillis();
         String originalQuery = query.text();
+        Timer.Sample bm25Sample = Timer.start();
 
         try {
+            // 策略零：BM25 关键词检索 (优先使用，建了索引后生效)
+            if (bm25Retriever != null) {
+                try {
+                    List<Map.Entry<Integer, Double>> bm25Results = bm25Retriever.search(originalQuery, keywordTopK);
+                    if (!bm25Results.isEmpty()) {
+                        ragMetrics.recordBM25Search(bm25Sample);
+                        List<ScoredDocument> docs = bm25Results.stream()
+                                .map(e -> new ScoredDocument(String.valueOf(e.getKey()), e.getValue(), originalQuery))
+                                .collect(Collectors.toList());
+                        log.debug("BM25 检索完成, 耗时: {}ms, 结果数: {}",
+                                System.currentTimeMillis() - startTime, docs.size());
+                        return docs;
+                    }
+                    log.debug("BM25 无结果，回退到 RediSearch 通配符检索");
+                } catch (Exception e) {
+                    log.warn("BM25 检索异常，回退到 RediSearch: {}", e.getMessage());
+                }
+            }
+
             // 策略一：中文分词 + OR 组合 (提高召回率的核心)
-            // 例如：将 "风电项目管理系统" 分词为 ["风电", "项目", "管理", "系统"]
-            // 构建查询语句：(风电|项目|管理|系统)，只要包含任意一个关键词即可命中
             List<String> keywords = tokenizeQuery(originalQuery);
 
             // 过滤掉停用词和过短的词，减少噪音
@@ -281,9 +334,11 @@ public class HybridRerankRetriever implements ContentRetriever {
                 }
             }
 
+            ragMetrics.recordBM25Search(bm25Sample);
             return results;
 
         } catch (Exception e) {
+            ragMetrics.recordBM25Search(bm25Sample);
             log.error("❌ [关键字检索] 执行失败", e);
             throw new RuntimeException("RediSearch 关键字检索失败", e);
         }

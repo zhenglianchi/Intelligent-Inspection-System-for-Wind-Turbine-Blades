@@ -158,6 +158,16 @@ export function getCurrentRebuildStatus() {
   return api.get('/api/knowledge/async/status')
 }
 
+// ==================== Metrics APIs ====================
+
+export function getMetrics() {
+  return api.get('/api/metrics/global')
+}
+
+export function getSessionMetrics() {
+  return api.get('/api/metrics/sessions')
+}
+
 // ==================== User APIs ====================
 
 export function login(user, pwd) {

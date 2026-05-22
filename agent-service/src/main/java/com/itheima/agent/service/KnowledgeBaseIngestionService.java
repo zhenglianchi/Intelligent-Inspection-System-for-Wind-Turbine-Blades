@@ -51,6 +51,15 @@ public class KnowledgeBaseIngestionService {
     @Autowired
     private ApplicationEventPublisher eventPublisher;
 
+    @Autowired(required = false)
+    private com.itheima.agent.retriever.BM25KeywordRetriever bm25Retriever;
+
+    @Autowired(required = false)
+    private com.itheima.agent.splitter.ParentChildSplitter parentChildSplitter;
+
+    @Autowired
+    private org.springframework.data.redis.core.StringRedisTemplate redisTemplate;
+
     // 阿里云文档解析服务，支持智能分割
     @Autowired
     private AliyunDocParserService aliyunDocParserService;
@@ -161,6 +170,8 @@ public class KnowledgeBaseIngestionService {
         ingestor.ingest(documents);
         log.info("存入成功！");
 
+        buildBM25Index();
+
         eventPublisher.publishEvent(new KnowledgeBaseUpdateEvent(this, "INGEST", documents.size() + " documents"));
     }
 
@@ -240,7 +251,40 @@ public class KnowledgeBaseIngestionService {
 
         log.info("存入成功！");
 
+        buildBM25Index();
+
         eventPublisher.publishEvent(new KnowledgeBaseUpdateEvent(this, "INGEST", documents.size() + " documents"));
+    }
+
+    /**
+     * 构建 BM25 关键词检索索引
+     * 优先使用父子索引的父 chunk (doc:parent:*)，若无则跳过
+     */
+    private void buildBM25Index() {
+        if (bm25Retriever == null) {
+            log.info("BM25 检索器未启用，跳过索引构建");
+            return;
+        }
+        try {
+            var parentKeys = redisTemplate.keys("doc:parent:*");
+            if (parentKeys != null && !parentKeys.isEmpty()) {
+                List<String> parentTexts = new ArrayList<>();
+                for (String key : parentKeys) {
+                    String text = redisTemplate.opsForValue().get(key);
+                    if (text != null && !text.trim().isEmpty()) {
+                        parentTexts.add(text);
+                    }
+                }
+                if (!parentTexts.isEmpty()) {
+                    bm25Retriever.buildIndex(parentTexts);
+                    log.info("BM25 索引构建完成, {} 个父 chunk", parentTexts.size());
+                }
+            } else {
+                log.info("未找到父 chunk (doc:parent:*), BM25 索引将在首次查询时通过 RediSearch 回退");
+            }
+        } catch (Exception e) {
+            log.warn("BM25 索引构建失败: {}", e.getMessage());
+        }
     }
 
     /**
@@ -256,6 +300,10 @@ public class KnowledgeBaseIngestionService {
         log.info("🔧 使用分割策略: {}", strategy);
 
         return switch (strategy) {
+            case "PARENT_CHILD" -> {
+                log.info("👨‍👧 父子索引分割策略");
+                yield parentChildSplitter;
+            }
             case "ALIYUN_SMART" -> {
                 log.info("🤖 阿里云智能分割配置 - 最大段落长度: {}, 启用子分割: {}", titleMaxSectionSize, titleEnableSubSplit);
                 yield new AliyunSmartSplitter(aliyunDocParserService, titleMaxSectionSize, chunkOverlap, titleEnableSubSplit);

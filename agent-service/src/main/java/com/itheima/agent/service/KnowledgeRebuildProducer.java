@@ -3,6 +3,7 @@ package com.itheima.agent.service;
 import com.itheima.agent.config.RabbitMQConfig;
 import com.itheima.agent.dto.KnowledgeRebuildStatus;
 import com.itheima.agent.dto.KnowledgeRebuildTask;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -28,7 +29,31 @@ public class KnowledgeRebuildProducer {
 
     private final Map<String, KnowledgeRebuildStatus> localStatusCache = new ConcurrentHashMap<>();
 
+    /** 启动时清除所有残留重建状态，防止重启后重复消费旧任务 */
+    @PostConstruct
+    public void cleanupOnStartup() {
+        try {
+            // 清除 Redis 中的重建状态
+            var keys = redisTemplate.keys(STATUS_KEY_PREFIX + "*");
+            if (keys != null && !keys.isEmpty()) {
+                redisTemplate.delete(keys);
+                log.info("启动时清除 {} 个残留重建状态", keys.size());
+            }
+            localStatusCache.clear();
+            // 清空重建队列中的待处理消息
+            rabbitTemplate.execute(channel -> {
+                channel.queuePurge(RabbitMQConfig.KNOWLEDGE_REBUILD_QUEUE);
+                return null;
+            });
+            log.info("重建队列已清空");
+        } catch (Exception e) {
+            log.warn("启动清理重建状态异常: {}", e.getMessage());
+        }
+    }
+
     public String submitRebuildTask(boolean clearBeforeRebuild) {
+        clearPreviousStatus();
+
         KnowledgeRebuildTask task = clearBeforeRebuild
                 ? KnowledgeRebuildTask.createClearAndRebuild()
                 : KnowledgeRebuildTask.createAppend();
@@ -134,5 +159,17 @@ public class KnowledgeRebuildProducer {
                 KnowledgeRebuildStatus.STATUS_COMPLETED.equals(entry.getValue().getStatus()) ||
                 KnowledgeRebuildStatus.STATUS_FAILED.equals(entry.getValue().getStatus())
         );
+    }
+
+    /** 清除上一次重建的所有残留状态 (Redis + 本地缓存) */
+    private void clearPreviousStatus() {
+        localStatusCache.clear();
+        try {
+            var keys = redisTemplate.keys(STATUS_KEY_PREFIX + "*");
+            if (keys != null && !keys.isEmpty()) redisTemplate.delete(keys);
+            log.info("🧹 已清除上次重建的 {} 个残留状态", keys != null ? keys.size() : 0);
+        } catch (Exception e) {
+            log.warn("清除残留状态异常: {}", e.getMessage());
+        }
     }
 }

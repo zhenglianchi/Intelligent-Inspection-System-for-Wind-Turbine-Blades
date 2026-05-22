@@ -30,10 +30,10 @@ public class AliyunDocParserService {
     @Value("${aliyun.docmind.enabled:true}")
     private boolean enabled;
 
-    @Value("${aliyun.docmind.timeout-seconds:300}")
+    @Value("${aliyun.docmind.timeout-seconds:60}")
     private int timeoutSeconds;
 
-    @Value("${aliyun.docmind.poll-interval-seconds:5}")
+    @Value("${aliyun.docmind.poll-interval-seconds:1}")
     private int pollIntervalSeconds;
 
     private Client client;
@@ -47,9 +47,9 @@ public class AliyunDocParserService {
                     .setAccessKeySecret(accessKeySecret);
             config.endpoint = "docmind-api.cn-hangzhou.aliyuncs.com";
             client = new Client(config);
-            log.info("✅ 阿里云文档智能服务初始化成功");
+            log.info("阿里云文档智能服务初始化成功");
         } else {
-            log.warn("⚠️ 阿里云文档智能服务未配置或未启用");
+            log.warn("阿里云文档智能服务未配置或未启用");
         }
     }
 
@@ -58,150 +58,155 @@ public class AliyunDocParserService {
     }
 
     public DocParseResult parseDocument(Path filePath) {
-        if (!isEnabled()) {
-            log.warn("阿里云文档智能服务未启用");
-            return null;
-        }
+        if (!isEnabled()) return null;
 
         try {
-            log.info("📄 [阿里云文档解析] 开始解析: {}", filePath.getFileName());
+            log.info("[阿里云文档解析] 开始解析: {}", filePath.getFileName());
 
             String jobId = submitJob(filePath);
             if (jobId == null) {
-                log.error("❌ 提交任务失败");
+                log.error("提交任务失败");
                 return null;
             }
+            log.info("[阿里云文档解析] 任务已提交, JobId: {}", jobId);
 
-            log.info("⏳ [阿里云文档解析] 任务已提交，JobId: {}", jobId);
-
-            if (!waitForCompletion(jobId)) {
-                log.error("❌ 任务处理超时或失败");
-                return null;
-            }
-
-            DocParseResult result = getResult(jobId);
+            DocParseResult result = pollForResult(jobId);
             if (result != null) {
-                log.info("✅ [阿里云文档解析] 解析完成，共 {} 个段落，{} 个大纲项",
-                        result.paragraphs.size(), result.outline.size());
+                log.info("[阿里云文档解析] 解析完成, {} 个段落", result.paragraphs.size());
             }
-
             return result;
 
         } catch (Exception e) {
-            log.error("❌ [阿里云文档解析] 解析失败", e);
+            log.error("[阿里云文档解析] 解析失败", e);
             return null;
         }
     }
 
+    /** SubmitDocParserJobAdvance 大模型版文档解析，上传本地文件 */
     private String submitJob(Path filePath) {
         try {
             File file = filePath.toFile();
-
-            try (FileInputStream fileInputStream = new FileInputStream(file)) {
-                SubmitDocParserJobAdvanceRequest request = new SubmitDocParserJobAdvanceRequest();
-                request.fileUrlObject = fileInputStream;
-                request.fileName = file.getName();
-
+            log.info("[DocParser] 提交文件: {} ({} bytes)", file.getName(), file.length());
+            try (FileInputStream fis = new FileInputStream(file)) {
+                SubmitDocParserJobAdvanceRequest req = new SubmitDocParserJobAdvanceRequest();
+                req.fileUrlObject = fis;
+                req.fileName = file.getName();
                 RuntimeOptions runtime = new RuntimeOptions();
-
-                SubmitDocParserJobResponse response = client.submitDocParserJobAdvance(request, runtime);
-
-                if (response.getBody() != null && response.getBody().getData() != null) {
-                    return response.getBody().getData().getId();
+                SubmitDocParserJobResponse resp = client.submitDocParserJobAdvance(req, runtime);
+                log.info("[DocParser] submit response body: {}", objectMapper.writeValueAsString(resp.getBody()));
+                if (resp.getBody() != null && resp.getBody().getData() != null) {
+                    String jobId = resp.getBody().getData().getId();
+                    log.info("[DocParser] jobId={}", jobId);
+                    return jobId;
                 }
-
-                return null;
+                log.error("[DocParser] body 或 body.data 为 null");
             }
         } catch (Exception e) {
             log.error("提交文档解析任务失败", e);
-            return null;
         }
+        return null;
     }
 
-    private boolean waitForCompletion(String jobId) throws InterruptedException {
+    /** 轮询 QueryDocParserStatus，超时后仍尝试 getDocParserResult */
+    private DocParseResult pollForResult(String jobId) throws InterruptedException {
         int maxRetries = timeoutSeconds / pollIntervalSeconds;
+        int pollMs = pollIntervalSeconds * 1000;
 
         for (int i = 0; i < maxRetries; i++) {
-            Thread.sleep(pollIntervalSeconds * 1000L);
-
-            QueryDocParserStatusRequest request = new QueryDocParserStatusRequest();
-            request.setId(jobId);
-
+            Thread.sleep(pollMs);
             try {
-                QueryDocParserStatusResponse response = client.queryDocParserStatus(request);
+                QueryDocParserStatusRequest req = new QueryDocParserStatusRequest();
+                req.setId(jobId);
+                QueryDocParserStatusResponse resp = client.queryDocParserStatus(req);
 
-                if (response.getBody() != null && response.getBody().getData() != null) {
-                    String status = response.getBody().getData().getStatus();
-                    log.debug("任务状态: {}", status);
+                if (resp.getBody() != null && resp.getBody().getData() != null) {
+                    String status = resp.getBody().getData().getStatus();
+                    if (status == null) continue;
 
-                    if ("SUCCEEDED".equals(status)) {
-                        return true;
-                    } else if ("FAILED".equals(status)) {
-                        log.error("任务处理失败，状态: {}", status);
-                        return false;
+                    // 匹配所有成功/处理中/失败状态变体
+                    String s = status.trim().toLowerCase();
+                    if (s.contains("success") || s.contains("succeeded")) {
+                        log.info("任务完成, 耗时 {}s", (i + 1) * pollIntervalSeconds);
+                        return getResult(jobId);
                     }
+                    if (s.contains("fail")) {
+                        log.error("任务处理失败, status={}", status);
+                        return null;
+                    }
+                    // processing / running: 继续等待
                 }
             } catch (Exception e) {
-                log.warn("查询任务状态异常: {}", e.getMessage());
+                log.warn("查询状态异常 (重试 {}/{}): {}", i + 1, maxRetries, e.getMessage());
             }
-
-            log.info("⏳ 等待任务完成... ({}/{})", i + 1, maxRetries);
         }
-
-        return false;
+        log.warn("轮询超时，尝试最后获取结果");
+        return getResult(jobId);
     }
 
     private DocParseResult getResult(String jobId) {
         try {
-            GetDocParserResultRequest request = new GetDocParserResultRequest();
-            request.setId(jobId);
-
-            GetDocParserResultResponse response = client.getDocParserResult(request);
-
-            if (response.getBody() != null && response.getBody().getData() != null) {
-                return parseResult(response.getBody().getData());
+            GetDocParserResultRequest req = new GetDocParserResultRequest();
+            req.setId(jobId);
+            req.setLayoutNum(0);
+            req.setLayoutStepSize(200);
+            GetDocParserResultResponse resp = client.getDocParserResult(req);
+            if (resp.getBody() == null) {
+                log.error("[DocParser] getResult body 为 null");
+                return null;
             }
-
-            return null;
+            Object data = resp.getBody().getData();
+            if (data != null) {
+                String json = objectMapper.writeValueAsString(data);
+                log.info("[DocParser] result JSON (first 500 chars): {}", json.length() > 500 ? json.substring(0, 500) : json);
+                return parseResult(data);
+            }
+            log.error("[DocParser] getResult data 为 null, body json: {}",
+                    objectMapper.writeValueAsString(resp.getBody()));
         } catch (Exception e) {
-            log.error("获取解析结果失败", e);
-            return null;
+            log.error("获取结果失败", e);
         }
+        return null;
     }
 
+    /** 解析 DocParser 大模型版返回 (layouts 数组) */
     private DocParseResult parseResult(Object data) {
         try {
             String jsonStr = objectMapper.writeValueAsString(data);
             JsonNode root = objectMapper.readTree(jsonStr);
-
             DocParseResult result = new DocParseResult();
             result.rawJson = jsonStr;
 
-            JsonNode layoutNode = root.path("layout");
-            if (layoutNode.isArray()) {
-                for (JsonNode node : layoutNode) {
-                    Paragraph para = parseParagraph(node);
-                    if (para != null && para.text != null && !para.text.trim().isEmpty()) {
+            // 关键: API 返回的 key 是 "layouts" (复数)
+            JsonNode layouts = root.path("layouts");
+            if (layouts.isArray()) {
+                for (JsonNode node : layouts) {
+                    Paragraph para = new Paragraph();
+                    para.text = node.path("text").asText("");
+                    para.type = node.path("type").asText("text");
+                    String subType = node.path("subType").asText("");
+                    para.pageNum = node.path("pageNum").asInt(0);
+
+                    // 标题判断基于 type 和 subType
+                    if ("title".equalsIgnoreCase(para.type) || "doc_title".equalsIgnoreCase(subType)) {
+                        para.isTitle = true;
+                        para.level = detectTitleLevel(para.text);
+                    } else if ("table".equalsIgnoreCase(para.type)) {
+                        para.isTable = true;
+                    }
+                    if (para.text != null && !para.text.trim().isEmpty()) {
                         result.paragraphs.add(para);
                     }
                 }
             }
-
             JsonNode outlineNode = root.path("outline");
             if (outlineNode.isArray()) {
                 for (JsonNode node : outlineNode) {
-                    OutlineItem item = parseOutlineItem(node);
-                    if (item != null) {
-                        result.outline.add(item);
-                    }
+                    OutlineItem item = new OutlineItem();
+                    item.uniqueId = node.path("uniqueId").asText("");
+                    item.level = node.path("level").asInt(0);
+                    result.outline.add(item);
                 }
             }
-
-            JsonNode markdownNode = root.path("content");
-            if (!markdownNode.isMissingNode()) {
-                result.markdown = markdownNode.asText();
-            }
-
             return result;
         } catch (Exception e) {
             log.error("解析结果转换失败", e);
@@ -209,70 +214,19 @@ public class AliyunDocParserService {
         }
     }
 
-    private Paragraph parseParagraph(JsonNode node) {
-        try {
-            Paragraph para = new Paragraph();
-            para.text = node.path("text").asText("");
-            para.type = node.path("type").asText("text");
-            para.pageIndex = node.path("pageIdx").asInt(0);
-
-            JsonNode posNode = node.path("pos");
-            if (posNode.isArray() && posNode.size() >= 4) {
-                para.x = posNode.get(0).asDouble();
-                para.y = posNode.get(1).asDouble();
-                para.width = posNode.get(2).asDouble() - para.x;
-                para.height = posNode.get(3).asDouble() - para.y;
-            }
-
-            String type = para.type.toLowerCase();
-            if (type.contains("title") || type.contains("header")) {
-                para.isTitle = true;
-                para.level = detectTitleLevel(para.text);
-            } else if (type.contains("table")) {
-                para.isTable = true;
-            } else if (type.contains("image") || type.contains("figure")) {
-                para.isImage = true;
-            }
-
-            JsonNode llmResultNode = node.path("llmResult");
-            if (!llmResultNode.isMissingNode()) {
-                para.llmResult = llmResultNode.asText();
-            }
-
-            return para;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     private int detectTitleLevel(String text) {
         if (text == null || text.isEmpty()) return 3;
-
         if (text.matches("^第[一二三四五六七八九十]+[章节篇部].*")) return 1;
         if (text.matches("^第\\d+[章节篇部].*")) return 1;
         if (text.matches("^\\d+\\.\\d+\\.\\d+.*")) return 3;
         if (text.matches("^\\d+\\.\\d+.*")) return 2;
         if (text.matches("^[一二三四五六七八九十]+[、.．].*")) return 2;
         if (text.matches("^\\d+[、.．].*")) return 2;
-
         return 3;
-    }
-
-    private OutlineItem parseOutlineItem(JsonNode node) {
-        try {
-            OutlineItem item = new OutlineItem();
-            item.text = node.path("text").asText("");
-            item.level = node.path("level").asInt(1);
-            item.pageIndex = node.path("pageIdx").asInt(0);
-            return item;
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     public static class DocParseResult {
         public String rawJson;
-        public String markdown;
         public List<Paragraph> paragraphs = new ArrayList<>();
         public List<OutlineItem> outline = new ArrayList<>();
     }
@@ -280,18 +234,15 @@ public class AliyunDocParserService {
     public static class Paragraph {
         public String text;
         public String type;
-        public int pageIndex;
-        public double x, y, width, height;
+        public int pageNum;
         public boolean isTitle;
         public boolean isTable;
-        public boolean isImage;
         public int level;
         public String llmResult;
     }
 
     public static class OutlineItem {
-        public String text;
+        public String uniqueId;
         public int level;
-        public int pageIndex;
     }
 }

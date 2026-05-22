@@ -17,10 +17,6 @@ spring:
     username: guest
     password: guest
     virtual-host: /
-    listener:
-      simple:
-        acknowledge-mode: auto
-        prefetch: 1
   cloud:
     nacos:
       discovery:
@@ -51,26 +47,26 @@ langchain4j:
   open-ai:
     chat-model:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api-key: sk-
+      api-key: sk-your_api_key
       model-name: qwen-plus
       log-requests: true
       log-responses: true
     streaming-chat-model:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api-key: sk-
+      api-key: sk-your_api_key
       model-name: qwen-plus
       log-requests: true
       log-responses: true
     embedding-model:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      api-key: sk-
+      api-key: sk-your_api_key
       model-name: text-embedding-v3
       log-requests: true
       log-responses: true
-      max-segments-per-batch: 10
+      max-segments-per-batch: 3
     rerank-model:
       base-url: https://dashscope.aliyuncs.com/api/v1/services/rerank
-      api-key: sk-
+      api-key: sk-your_api_key
       model-name: gte-rerank-v2
       log-requests: true
       log-responses: true
@@ -86,10 +82,10 @@ langchain4j:
 aliyun:
   docmind:
     enabled: true
-    access-key-id: LTA
-    access-key-secret: n5b
-    timeout-seconds: 300
-    poll-interval-seconds: 5
+    access-key-id: your-access-key-id
+    access-key-secret: your-access-key-secret
+    timeout-seconds: 60
+    poll-interval-seconds: 1
 
 mybatis:
   configuration:
@@ -116,13 +112,14 @@ management:
       application: agent-service
 
 rag:
-  pdf-path: D:/Awork/RAG/wind-power-microservice/agent-service/src/main/resources/content
+  pdf-path: D:/Awork/RAG/Intelligent-Inspection-System-for-Wind-Turbine-Blades/agent-service/src/main/resources/content
   auto-init: false
   index-name: embedding-index
-  chunk-size: 800
-  chunk-overlap: 200
   splitter:
-    strategy: ALIYUN_SMART
+    strategy: PARENT_CHILD
+    parent-child:
+      child-size: 400
+      child-overlap: 100
     title:
       max-section-size: 2000
       enable-sub-split: true
@@ -136,10 +133,12 @@ rag:
     rerank-threshold: 0.3
     keyword:
       fuzzy-enabled: true
+  bm25:
+    min-score: 0.1
   memory:
     short-term:
-      window-size: 10
-      window-ttl-days: 1
+      window-size: 20
+      window-ttl-days: 7
     inject-long-term: true
     archive-ttl-days: 30
     retrieval:
@@ -153,6 +152,21 @@ rag:
   turbine:
     default-limit: 50
     fault-limit: 100
+  cache:
+    semantic:
+      enabled: true
+      min-similarity: 0.85
+      ttl-minutes: 30
+  compression:
+    max-tokens: 500000
+    truncate-threshold: 0.70
+    summarize-threshold: 0.90
+  agent:
+    flash-model: qwen3.6-flash
+  react:
+    max-steps: 5
+    max-retries-per-call: 2
+    max-calls-per-tool: 3
   degradation:
     level: NORMAL
     rag-enabled: true
